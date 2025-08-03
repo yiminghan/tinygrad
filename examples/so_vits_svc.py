@@ -1,14 +1,13 @@
 # original implementation: https://github.com/svc-develop-team/so-vits-svc
 from __future__ import annotations
-import sys, os, logging, time, io, math, argparse, operator, numpy as np
+import sys, logging, time, io, math, argparse, operator, numpy as np
 from functools import partial, reduce
 from pathlib import Path
 from typing import Tuple, Optional, Type
-from tinygrad import nn
-from tinygrad.tensor import Tensor
-from tinygrad.helpers import dtypes, getenv
-from tinygrad.state import torch_load
-from examples.vits import ResidualCouplingBlock, PosteriorEncoder, Encoder, ResBlock1, ResBlock2, LRELU_SLOPE, sequence_mask, split, download_if_not_present, get_hparams_from_file, load_checkpoint, weight_norm, HParams
+from tinygrad import nn, dtypes, Tensor
+from tinygrad.helpers import getenv, fetch
+from tinygrad.nn.state import torch_load
+from examples.vits import ResidualCouplingBlock, PosteriorEncoder, Encoder, ResBlock1, ResBlock2, LRELU_SLOPE, sequence_mask, split, get_hparams_from_file, load_checkpoint, weight_norm, HParams
 from examples.sovits_helpers import preprocess
 import soundfile
 
@@ -94,7 +93,7 @@ class ContentVec:
     return res, padding_mask
   @classmethod
   def load_from_pretrained(cls, checkpoint_path:str, checkpoint_url:str) -> ContentVec:
-    download_if_not_present(checkpoint_path, checkpoint_url)
+    fetch(checkpoint_url, checkpoint_path)
     cfg = load_fairseq_cfg(checkpoint_path)
     enc = cls(cfg.model)
     _ = load_checkpoint_enc(checkpoint_path, enc, None)
@@ -210,7 +209,7 @@ class MultiHeadAttention:
     ret =  self.out_proj(wv).transpose(0,1)  # BxTxC -> TxBxC
     return ret
 
-class ConvFeatureExtractionModel():
+class ConvFeatureExtractionModel:
   def __init__(self, conv_layers, dropout=.0, mode="default", conv_bias=False):
     assert mode in {"default", "group_norm_masked", "layer_norm"}
     def block(n_in, n_out, k, stride, is_layer_norm=False, is_group_norm=False, conv_bias=False):
@@ -220,7 +219,7 @@ class ConvFeatureExtractionModel():
         return conv
       assert (is_layer_norm and is_group_norm) == False, "layer norm and group norm are exclusive"
       if is_layer_norm:
-        return [make_conv(), partial(Tensor.dropout, p=dropout),[partial(Tensor.transpose, ax1=-2, ax2=-1), nn.LayerNorm(dim, elementwise_affine=True), partial(Tensor.transpose, ax1=-2, ax2=-1)], Tensor.gelu]
+        return [make_conv(), partial(Tensor.dropout, p=dropout),[partial(Tensor.transpose, dim0=-2, dim1=-1), nn.LayerNorm(dim, elementwise_affine=True), partial(Tensor.transpose, dim0=-2, dim1=-1)], Tensor.gelu]
       elif is_group_norm and mode == "default":
         return [make_conv(), partial(Tensor.dropout, p=dropout), nn.GroupNorm(dim, dim, affine=True), Tensor.gelu]
       elif is_group_norm and mode == "group_norm_masked":
@@ -321,9 +320,9 @@ class Synthesizer:
     return f0_coarse
   @classmethod
   def load_from_pretrained(cls, config_path:str, config_url:str, weights_path:str, weights_url:str) -> Synthesizer:
-    download_if_not_present(config_path, config_url)
+    fetch(config_url, config_path)
     hps = get_hparams_from_file(config_path)
-    download_if_not_present(weights_path, weights_url)
+    fetch(weights_url, weights_path)
     net_g = cls(hps.data.filter_length // 2 + 1, hps.train.segment_size // hps.data.hop_length, **hps.model)
     _ = load_checkpoint(weights_path, net_g, None, skip_list=["f0_decoder"])
     logging.debug(f"{cls.__name__}:Loaded model with hps: {hps}")
@@ -352,27 +351,27 @@ class Upsample:
     new_shape = (*x.shape[:-1], x.shape[-1] * self.scale)
     return x.unsqueeze(-1).repeat(repeats).reshape(new_shape)
 
-class SineGen():
+class SineGen:
   def __init__(self, samp_rate, harmonic_num=0, sine_amp=0.1, noise_std=0.003, voice_threshold=0, flag_for_pulse=False):
     self.sine_amp, self.noise_std, self.harmonic_num, self.sampling_rate, self.voiced_threshold, self.flag_for_pulse = sine_amp, noise_std, harmonic_num, samp_rate, voice_threshold, flag_for_pulse
     self.dim = self.harmonic_num + 1
   def _f02uv(self, f0): return (f0 > self.voiced_threshold).float()  #generate uv signal
   def _f02sine(self, f0_values):
-    def padDiff(x : Tensor): return (x.pad2d((0,0,-1,1)) - x).pad2d((0,0,0,-1))
+    def padDiff(x : Tensor): return (x.pad((0,0,-1,1)) - x).pad((0,0,0,-1))
     def mod(x: Tensor, n: int) -> Tensor: return x - n * x.div(n).floor()  # this is what the % operator does in pytorch.
     rad_values = mod((f0_values / self.sampling_rate) , 1)  # convert to F0 in rad
     rand_ini = Tensor.rand(f0_values.shape[0], f0_values.shape[2], device=f0_values.device)  # initial phase noise
 
     #rand_ini[:, 0] = 0
-    m = Tensor.ones(f0_values.shape[0]).unsqueeze(1).pad2d((0,f0_values.shape[2]-1,0,0)).cast(dtypes.bool)
+    m = Tensor.ones(f0_values.shape[0]).unsqueeze(1).pad((0,f0_values.shape[2]-1,0,0)).cast(dtypes.bool)
     m = tilde(m)
     rand_ini = m.where(rand_ini, 0)
 
     #rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
     tmp = rad_values[:, 0, :] + rand_ini
-    m = Tensor.ones(tmp.shape).pad2d((0,0,0,rad_values.shape[1]-1,0)).cast(dtypes.bool)
+    m = Tensor.ones(tmp.shape).pad((0,0,0,rad_values.shape[1]-1,0)).cast(dtypes.bool)
     m = tilde(m)
-    tmp = tmp.unsqueeze(1).pad2d((0,0,0,rad_values.shape[1]-1,0))
+    tmp = tmp.unsqueeze(1).pad((0,0,0,rad_values.shape[1]-1,0))
     rad_values = m.where(rad_values, tmp)
 
     tmp_over_one = mod(rad_values.cumsum(1), 1)
@@ -380,7 +379,7 @@ class SineGen():
     cumsum_shift = Tensor.zeros_like(rad_values)
 
     #cumsum_shift[:, 1:, :] = tmp_over_one_idx * -1.0
-    tmp_over_one_idx = (tmp_over_one_idx * -1.0).pad2d((0,0,1,0))
+    tmp_over_one_idx = (tmp_over_one_idx * -1.0).pad((0,0,1,0))
     cumsum_shift = tmp_over_one_idx
 
     sines = ((rad_values + cumsum_shift).cumsum(1) * 2 * np.pi).sin()
@@ -434,14 +433,14 @@ class Generator:
     x = self.conv_pre(x)
     if g is not None:  x = x + self.cond(g)
     for i in range(self.num_upsamples):
-      x, xs = self.ups[i](x.leakyrelu(LRELU_SLOPE)), None
+      x, xs = self.ups[i](x.leaky_relu(LRELU_SLOPE)), None
       x_source = self.noise_convs[i](har_source)
       x = x + x_source
       for j in range(self.num_kernels):
         if xs is None: xs = self.resblocks[i * self.num_kernels + j].forward(x)
         else: xs += self.resblocks[i * self.num_kernels + j].forward(x)
       x = xs / self.num_kernels
-    return self.conv_post(x.leakyrelu()).tanh()
+    return self.conv_post(x.leaky_relu()).tanh()
 
 # **** helpers ****
 
@@ -465,17 +464,17 @@ def repeat_expand_2d_left(content, target_len): # content : [h, t]
     if i >= temp[current_pos+1]:
       current_pos += 1
     cols.append(content[:, current_pos])
-  return Tensor.stack(cols).transpose(0, 1)
+  return Tensor.stack(*cols).transpose(0, 1)
 
 def load_fairseq_cfg(checkpoint_path):
-  assert os.path.isfile(checkpoint_path)
+  assert Path(checkpoint_path).is_file()
   state = torch_load(checkpoint_path)
   cfg = state["cfg"] if ("cfg" in state and state["cfg"] is not None) else None
   if cfg is None: raise RuntimeError(f"No cfg exist in state keys = {state.keys()}")
   return HParams(**cfg)
 
 def load_checkpoint_enc(checkpoint_path, model: ContentVec, optimizer=None, skip_list=[]):
-  assert os.path.isfile(checkpoint_path)
+  assert Path(checkpoint_path).is_file()
   start_time = time.time()
   checkpoint_dict = torch_load(checkpoint_path)
   saved_state_dict = checkpoint_dict['model']
@@ -501,7 +500,7 @@ def load_checkpoint_enc(checkpoint_path, model: ContentVec, optimizer=None, skip
         obj, v = getattr(parent, "weight"), weight_norm(weight_v, weight_g, 0)
         weight_g, weight_v, parent, skip = None, None, None, False
       if not skip and obj.shape == v.shape:
-        if "feature_extractor" in key and (isinstance(parent, nn.GroupNorm) or isinstance(parent, nn.LayerNorm)):  # cast
+        if "feature_extractor" in key and (isinstance(parent, (nn.GroupNorm, nn.LayerNorm))):  # cast
           obj.assign(v.to(obj.device).float())
         else:
           obj.assign(v.to(obj.device))
@@ -550,7 +549,7 @@ def get_encoder(ssl_dim) -> Type[SpeechEncoder]:
 # DEMO USAGE (uses audio sample from LJ-Speech):
 # python3 examples/so_vits_svc.py --model saul_goodman
 #########################################################################################
-SO_VITS_SVC_PATH = Path(__file__).parent.parent / "weights/So-VITS-SVC"
+SO_VITS_SVC_PATH = Path(__file__).parents[1] / "weights/So-VITS-SVC"
 VITS_MODELS = { # config_path, weights_path, config_url, weights_url
   "saul_goodman" : (SO_VITS_SVC_PATH / "config_saul_gman.json", SO_VITS_SVC_PATH / "pretrained_saul_gman.pth", "https://huggingface.co/Amo/so-vits-svc-4.0_GA/resolve/main/ModelsFolder/Saul_Goodman_80000/config.json", "https://huggingface.co/Amo/so-vits-svc-4.0_GA/resolve/main/ModelsFolder/Saul_Goodman_80000/G_80000.pth"),
   "drake" : (SO_VITS_SVC_PATH / "config_drake.json", SO_VITS_SVC_PATH / "pretrained_drake.pth", "https://huggingface.co/jaspa/so-vits-svc/resolve/main/aubrey/config_aubrey.json", "https://huggingface.co/jaspa/so-vits-svc/resolve/main/aubrey/pretrained_aubrey.pth"),
@@ -563,13 +562,13 @@ ENCODER_MODELS = { # weights_path, weights_url
   "contentvec": (SO_VITS_SVC_PATH / "contentvec_checkpoint.pt", "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/hubert_base.pt")
 }
 ENCODER_MODEL = "contentvec"
-DEMO_PATH, DEMO_URL = Path(__file__).parent.parent / "temp/LJ037-0171.wav", "https://keithito.com/LJ-Speech-Dataset/LJ037-0171.wav"
+DEMO_PATH, DEMO_URL = Path(__file__).parents[1] / "temp/LJ037-0171.wav", "https://keithito.com/LJ-Speech-Dataset/LJ037-0171.wav"
 if __name__=="__main__":
   logging.basicConfig(stream=sys.stdout, level=(logging.INFO if DEBUG < 1 else logging.DEBUG))
   parser = argparse.ArgumentParser()
   parser.add_argument("-m", "--model", default=None, help=f"Specify the model to use. All supported models: {VITS_MODELS.keys()}", required=True)
   parser.add_argument("-f", "--file", default=DEMO_PATH, help=f"Specify the path of the input file")
-  parser.add_argument("--out_dir", default=str(Path(__file__).parent.parent / "temp"), help="Specify the output path.")
+  parser.add_argument("--out_dir", default=str(Path(__file__).parents[1] / "temp"), help="Specify the output path.")
   parser.add_argument("--out_path", default=None, help="Specify the full output path. Overrides the --out_dir and --name parameter.")
   parser.add_argument("--base_name", default="test", help="Specify the base of the output file name. Default is 'test'.")
   parser.add_argument("--speaker", default=None, help="If not specified, the first available speaker is chosen. Usually there is only one speaker per model.")
@@ -584,7 +583,7 @@ if __name__=="__main__":
   vits_model = args.model
   encoder_location, vits_location = ENCODER_MODELS[ENCODER_MODEL], VITS_MODELS[vits_model]
 
-  Tensor.no_grad, Tensor.training = True, False
+  Tensor.training = False
   # Get Synthesizer and ContentVec
   net_g, hps = Synthesizer.load_from_pretrained(vits_location[0], vits_location[2], vits_location[1], vits_location[3])
   Encoder = get_encoder(hps.model.ssl_dim)
@@ -599,8 +598,8 @@ if __name__=="__main__":
   speaker = args.speaker if args.speaker is not None else list(hps.spk.__dict__.keys())[0]
 
   ### Loading audio and slicing ###
-  if audio_path == DEMO_PATH: download_if_not_present(DEMO_PATH, DEMO_URL)
-  assert os.path.isfile(audio_path) and Path(audio_path).suffix == ".wav"
+  if audio_path == DEMO_PATH: fetch(DEMO_URL, DEMO_PATH)
+  assert Path(audio_path).is_file() and Path(audio_path).suffix == ".wav"
   chunks = preprocess.cut(audio_path, db_thresh=slice_db)
   audio_data, audio_sr = preprocess.chunks2audio(audio_path, chunks)
 
